@@ -75,7 +75,7 @@ def get_appropriate_platform() -> LatticeECP5Platform:
     try:
         # Figure out what hardware revision we're going to connect to...
         debugger = apollo.ApolloDebugger()
-        version = debugger.detect_connected_version()
+        version = debugger.get_hardware_revision()
 
         # ... and look up the relevant platform accordingly.
         platform = PLATFORM_FOR_REVISION[version]()

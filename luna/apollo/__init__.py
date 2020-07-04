@@ -4,7 +4,9 @@
 # Copyright (c) 2020 Great Scott Gadgets <info@greatscottgadgets.com>
 # SPDX-License-Identifier: BSD-3-Clause
 
-import usb.core
+import atexit
+
+from usb1 import USBContext, USBError, ENDPOINT_IN, ENDPOINT_OUT, RECIPIENT_DEVICE, TYPE_VENDOR
 
 from .jtag  import JTAGChain
 from .flash import ConfigurationFlash
@@ -16,15 +18,19 @@ from .intel import IntelJTAGProgrammer
 from .onboard_jtag import *
 
 class DebuggerNotFound(IOError):
+    """ Class that indicates that an Apollo Debug device could not be found. """
     pass
 
 
 def create_ila_frontend(ila, *, use_cs_multiplexing=False):
     """ Convenience method that instantiates an Apollo debug session and creates an ILA frontend from it.
 
-    Parameters:
-        ila -- The SyncSerialILA object we'll be connecting to.
+    Parameters
+    ----------
+    ila: SyncSerialILA
+        The ILA object we'll be connecting to.
     """
+
     debugger = ApolloDebugger()
     return ApolloILAFrontend(debugger, ila=ila, use_inverted_cs=use_cs_multiplexing)
 
@@ -33,8 +39,6 @@ def create_ila_frontend(ila, *, use_cs_multiplexing=False):
 class ApolloDebugger:
     """ Class representing a link to an Apollo Debug Module. """
 
-    # This VID/PID pair is unique to development LUNA boards.
-    # TODO: potentially change this to an OpenMoko VID, like other LUNA boards.
     USB_IDS  = [(0x1d50, 0x615c), (0x16d0, 0x05a5)]
 
     REQUEST_SET_LED_PATTERN = 0xa1
@@ -62,21 +66,25 @@ class ApolloDebugger:
         0xFE: "Amalthea"
     }
 
+    # Class variable that stores our global libusb context.
+    _libusb_context: USBContext = None
+
 
     def __init__(self):
         """ Sets up a connection to the debugger. """
 
         # Try to create a connection to our Apollo debug firmware.
         for vid, pid in self.USB_IDS:
-            device = usb.core.find(idVendor=vid, idProduct=pid)
-            if device is not None:
+            handle = self.libusb_context().openByVendorIDAndProductID(vid, pid)
+            if handle is not None:
                 break
 
         # If we couldn't find an Apollo device, bail out.
-        if device is None:
+        if handle is None:
             raise DebuggerNotFound()
 
-        self.device = device
+        self.handle = handle
+        self.device = handle.getDevice()
         self.major, self.minor = self.get_hardware_revision()
 
         # Create our basic interfaces, for debugging convenience.
@@ -85,17 +93,29 @@ class ApolloDebugger:
         self.flash = ConfigurationFlash(self)
 
 
-    def detect_connected_version(self):
-        """ Attempts to determine the revision of the connected hardware.
+    @classmethod
+    def _destroy_libusb_context(cls):
+        """ Destroys our libusb context on closing our Python instance. """
 
-        Returns the relevant hardware's revision number, as (major, minor).
+        cls._libusb_context.close()
+        cls._libusb_context = None
+
+
+    @classmethod
+    def libusb_context(cls):
+        """ Retrieves the libusb context, creating one if needed.
+
+        Returns
+        -------
+        USBContext
+            The libusb context.
         """
 
-        # Extract the major and minor from the device's USB descriptor.
-        minor = self.device.bcdDevice & 0xFF
-        major = self.device.bcdDevice >> 8
+        if cls._libusb_context is None:
+            cls._libusb_context = USBContext().open()
+            atexit.register(cls._destroy_libusb_context)
 
-        return major, minor
+        return cls._libusb_context
 
 
     def get_fpga_type(self):
@@ -103,6 +123,11 @@ class ApolloDebugger:
 
         The returned format is the same as used in a nMigen platform file; and can be used to override
         a platform's device type.
+
+        Returns
+        -------
+        str
+            The type of FPGA populated on the connected LUNA board.
         """
 
         with self.jtag as jtag:
@@ -122,20 +147,39 @@ class ApolloDebugger:
 
     @property
     def serial_number(self):
-        """ Returns the device's serial number, as a string. """
-        return self.device.serial_number
+        """ Returns the device's serial number, as a string.
+
+        Returns
+        -------
+        str
+            The device's serial number.
+        """
+        return self.device.getSerialNumber()
 
 
     def get_hardware_revision(self):
-        """ Returns the (major, minor) of the attached hardware revision. """
+        """ Determines and returns the revision of the connected hardware.
 
-        minor = self.device.bcdDevice & 0xFF
-        major = self.device.bcdDevice >> 8
+        Returns
+        -------
+        (int, int)
+            The relevant hardware's major and minor version numbers.
+        """
+
+        # Extract the major and minor from the device's USB descriptor.
+        minor = self.device.getbcdDevice() & 0xFF
+        major = self.device.getbcdDevice() >> 8
         return major, minor
 
 
     def get_hardware_name(self):
-        """ Returns a string describing this piece of hardware. """
+        """ Returns a string describing this piece of hardware.
+
+        Returns
+        -------
+        str
+            The name for this piece of hardware.
+        """
 
         # If this is a non-LUNA board, we'll look up its name in our table.
         if self.major == self.EXTERNAL_BOARD_MAJOR:
@@ -154,46 +198,62 @@ class ApolloDebugger:
 
 
     def get_compatibility_string(self):
-        """ Returns 'LUNA' for a LUNA board; or 'LUNA-compatible' for supported external board."""
+        """ Returns 'LUNA' for a LUNA board; or 'LUNA-compatible' for supported external board.
+
+        Returns
+        -------
+        str: {'LUNA', 'LUNA-compatible'}
+            The compatibility string the connected board.
+        """
 
         if self.major == self.EXTERNAL_BOARD_MAJOR:
             return 'LUNA-compatible'
         elif self.major in self.SUBDEVICE_MAJORS:
             return self.SUBDEVICE_MAJORS[self.major]
 
-        return 'LUNA'
-
-    def create_jtag_programmer(self, jtag_chain):
-        """ Returns the JTAG programmer for the given device. """
-
-        # If this is an external programmer, return its programmer type.
-        if self.major == self.EXTERNAL_BOARD_MAJOR:
-            programmer = self.EXTERNAL_BOARD_PROGRAMMERS[self.minor]
-        # Otherwise, it should be an ECP5.
-        else:
-            programmer = ECP5_JTAGProgrammer
-
-        return programmer(jtag_chain)
-
-
-
     def out_request(self, number, value=0, index=0, data=None, timeout=5000):
-        """ Helper that issues an OUT control request to the debugger. """
+        """ Helper that issues an OUT control request to the debugger.
 
-        request_type = usb.ENDPOINT_OUT | usb.RECIP_DEVICE | usb.TYPE_VENDOR
-        return self.device.ctrl_transfer(request_type, number, value, index, data, timeout=timeout)
+        All parameters match their SETUP packet definitions.
+
+        Returns
+        -------
+        int
+            The number of bytes actually sent.
+        """
+
+        if data is None:
+            data = bytes()
+
+        request_type = ENDPOINT_OUT | RECIPIENT_DEVICE | TYPE_VENDOR
+        return self.handle.controlWrite(request_type, number, value, index, data, timeout=timeout)
 
 
     def in_request(self, number, value=0, index=0, length=0, timeout=500):
-        """ Helper that issues an IN control request to the debugger. """
+        """ Helper that issues an IN control request to the debugger.
 
-        request_type = usb.ENDPOINT_IN | usb.RECIP_DEVICE | usb.TYPE_VENDOR
-        result = self.device.ctrl_transfer(request_type, number, value, index, length, timeout=timeout)
+        All parameters match their SETUP packet definitions.
+
+        Returns
+        -------
+        bytes
+            The data read from the device.
+        """
+
+        request_type = ENDPOINT_IN | RECIPIENT_DEVICE | TYPE_VENDOR
+        result = self.handle.controlRead(request_type, number, value, index, length, timeout=timeout)
 
         return bytes(result)
 
 
     def set_led_pattern(self, number):
+        """ Sets the LED pattern to match the number specified.
+
+        Parameters
+        ----------
+        number: int
+            The number representing the pattern to set the LEDs to.
+        """
         self.out_request(self.REQUEST_SET_LED_PATTERN, number)
 
 
@@ -201,5 +261,5 @@ class ApolloDebugger:
         """ Resets the target (FPGA/etc) connected to the debug controller. """
         try:
             self.out_request(self.REQUEST_RECONFIGURE)
-        except usb.core.USBError:
+        except USBError:
             pass
