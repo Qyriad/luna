@@ -146,15 +146,19 @@ class AsyncTransferManager():
         self.device_handle = device_handle
 
         self.active_transfers = []
+        self.num_transfers = 0
         self.completed_transfers = []
         self.total_data_transferred = 0
+
+        self.start_time = None
+        self.end_time = None
 
         self._error = None
 
 
     async def _handle_events(self):
 
-        while self.active_transfers:
+        while self.num_transfers:
 
             try:
                 self.context.handleEvents()
@@ -166,19 +170,19 @@ class AsyncTransferManager():
 
     def _transfer_complete_cb(self, transfer: USBTransfer):
 
-        # Mark it as 'complete', regardless of whether the status is actually TRANSFER_COMPLETED or not,
-        # because even if it errored, we still want _do_transfer() to continue.
-        self.completed_transfers.append(transfer)
-
+        future = transfer.getUserData()
         status = transfer.getStatus()
+
         if status == usb1.TRANSFER_COMPLETED:
 
-            self.total_data_transferred += transfer.getActualLength()
+            length = transfer.getActualLength()
+            future.set_result(length)
 
         else:
 
             # Time to bail out.
             self._error = status
+            future.cancel()
 
 
     def _setup_transfers(self):
@@ -187,11 +191,13 @@ class AsyncTransferManager():
 
             # Allocate the transfer...
             transfer = self.device_handle.getTransfer()
-            transfer.setBulk(BULK_ENDPOINT_IN, TEST_TRANSFER_SIZE,
-                callback=self._transfer_complete_cb, timeout=1000)
+            transfer.setBulk(BULK_ENDPOINT_IN, TEST_TRANSFER_SIZE, timeout=1000,
+                callback=self._transfer_complete_cb)
+
 
             # ...and store it.
             self.active_transfers.append(transfer)
+            self.num_transfers += 1
 
 
     async def _wait_for_transfer_complete(self, transfer):
@@ -207,49 +213,63 @@ class AsyncTransferManager():
 
 
     async def _do_transfer(self, transfer: USBTransfer):
+        """ Repeatedly submits the transfer until it's time to cancel. """
 
-        # Keep resubmitting the transfer until it's time to cancel.
+        loop = asyncio.get_event_loop()
+
         while not self._should_cancel():
+
+            future = loop.create_future()
+            transfer.setUserData(future)
 
             transfer.submit()
 
-            await self._wait_for_transfer_complete(transfer)
+            try:
+                length = await future
 
-        self.active_transfers.remove(transfer)
+                # Don't count any data we receive after we've recorded the end time.
+                if self.end_time is None:
+                    self.total_data_transferred += length
 
-        # This calls libusb_transfer_free(transfer).
-        del transfer
+            except asyncio.CancelledError:
+                break
+
+            # await self._wait_for_transfer_complete(transfer)
+
+        if self.end_time is None:
+            self.end_time = time.time()
+
+        self.num_transfers -= 1
 
 
     def run(self):
 
-        async def _submit_transfers():
-            """ Because you can't asyncio.run(ayncio.gather()). """
-
-            # print(self.active_transfers)
-            coroutines = [self._do_transfer(transfer) for transfer in self.active_transfers]
-            coroutines.append(self._handle_events())
-
-            # Call all the transfers asynchronously, and then also add _handle_events() to our event loop. FIXME:
+        async def _gather_coroutines(*coroutines):
+            """ Because you can't asyncio.run(asyncio.gather()). """
             await asyncio.gather(*coroutines)
 
         self._setup_transfers()
 
+        coroutines = [self._do_transfer(transfer) for transfer in self.active_transfers]
+        coroutines.append(self._handle_events())
+
         # Start our benchmark timer.
-        start_time = time.time()
+        self.start_time = time.time()
 
-        asyncio.run(_submit_transfers())
+        asyncio.run(_gather_coroutines(*coroutines))
 
-        while self.active_transfers:
-            pass
+        elapsed = self.end_time - self.start_time
 
-        end_time = time.time()
+        for transfer in self.active_transfers:
+
+            # libusb_transfer_free(transfer)
+            del transfer
 
         if self._error:
             logging.error('Test failed because a transfer {}.'.format(self._ERROR_MESSAGES[self._error]))
 
 
-        bytes_per_second = self.total_data_transferred / (end_time - start_time)
+        bytes_per_second = self.total_data_transferred / (elapsed)
         logging.info('Received {} MB total at {} MB/s.'.format(self.total_data_transferred / 1000000, bytes_per_second / 1000000))
 
 
