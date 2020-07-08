@@ -140,7 +140,7 @@ class AsyncTransferManager():
     }
 
 
-    def __init__(self, context: USBContext, device_handle: USBDeviceHandle):
+    def __init__(self, context: USBContext, device_handle: USBDeviceHandle, transfer_size, transfer_depth):
 
         self.context = context
         self.device_handle = device_handle
@@ -152,6 +152,9 @@ class AsyncTransferManager():
 
         self.start_time = None
         self.end_time = None
+
+        self.transfer_size = transfer_size
+        self.transfer_depth = transfer_depth
 
         self._error = None
 
@@ -187,11 +190,11 @@ class AsyncTransferManager():
 
     def _setup_transfers(self):
 
-        for _ in range(TRANSFER_QUEUE_DEPTH):
+        for _ in range(self.transfer_depth):
 
             # Allocate the transfer...
             transfer = self.device_handle.getTransfer()
-            transfer.setBulk(BULK_ENDPOINT_IN, TEST_TRANSFER_SIZE, timeout=1000,
+            transfer.setBulk(BULK_ENDPOINT_IN, self.transfer_size, timeout=1000,
                 callback=self._transfer_complete_cb)
 
 
@@ -270,7 +273,9 @@ class AsyncTransferManager():
 
 
         bytes_per_second = self.total_data_transferred / (elapsed)
-        logging.info('Received {} MB total at {} MB/s.'.format(self.total_data_transferred / 1000000, bytes_per_second / 1000000))
+        # logging.info('Received {} MB total at {} MB/s.'.format(self.total_data_transferred / 1000000, bytes_per_second / 1000000))
+
+        return bytes_per_second / 1000000
 
 
 
@@ -288,8 +293,32 @@ def run_async_speed_test():
         # ...and claim its bulk interface.
         handle.claimInterface(0)
 
-        manager = AsyncTransferManager(context, handle)
-        manager.run()
+        averages = []
+
+        for test in range(10):
+
+            for transfer_size in range(1024, 1024 * 16, 1024):
+
+                for transfer_depth in range(2, 16):
+
+                    # logging.info("Async test with {:02} {} byte transfers.".format(transfer_depth, transfer_size))
+
+                    speeds = []
+
+                    for i in range(20):
+
+                        manager = AsyncTransferManager(context, handle, transfer_size, transfer_depth)
+                        speed = manager.run()
+                        speeds.append(speed)
+
+                    avg = sum(speeds) / len(speeds)
+                    # logging.info('{:02} {} byte transfers: {}'.format(transfer_depth, transfer_size, avg))
+                    averages.append((transfer_depth, transfer_size, avg))
+                    # logging.info('Average: {} MB/s.'.format(sum(speeds) / len(speeds)))
+
+            # logging.info("Maximum: {}".format((x for x in averages if x[
+            depth, size, avg = max(averages, key=lambda tup : tup[2])
+            logging.info("Maximum: {} {} byte transfers: {}".format(depth, size, avg))
 
 
 def run_speed_test():
