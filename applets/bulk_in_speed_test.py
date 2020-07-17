@@ -12,14 +12,11 @@ import logging
 import time
 import asyncio
 
-from enum import Enum
-
 import usb1
-import libusb1
 
 from usb1 import USBContext, USBTransfer, USBDeviceHandle, ENDPOINT_IN
 
-from nmigen                  import Elaboratable, Module, ClockDomain, ClockSignal
+from nmigen                  import Elaboratable, Module
 from usb_protocol.emitters   import DeviceDescriptorCollection
 
 from luna                    import top_level_cli
@@ -34,13 +31,12 @@ BULK_ENDPOINT_IN = ENDPOINT_IN | BULK_ENDPOINT_NUMBER
 MAX_BULK_PACKET_SIZE = 64 if os.getenv('LUNA_FULL_ONLY') else 512
 
 # Set the total amount of data to be used in our speed test.
-TEST_DATA_SIZE = 1 * 1024 * 1024
-TEST_TRANSFER_SIZE = 16 * 1024
+TEST_DATA_SIZE = 1 * 1024 * 1024 * 1024
+TEST_TRANSFER_SIZE = 12 * 1024
 
 # Size of the host-size "transfer queue" -- this is effectively the number of async transfers we'll
 # have scheduled at a given time.
-TRANSFER_QUEUE_DEPTH = 16
-
+TRANSFER_QUEUE_DEPTH = 4
 
 
 class USBInSpeedTestDevice(Elaboratable):
@@ -121,40 +117,32 @@ class USBInSpeedTestDevice(Elaboratable):
         return m
 
 
-# Create an enum that strips the LIBUSB_TRANSFER_ prefix from the constant names.
-TransferStatus = Enum('TransferStatus',
-    {key[len('LIBUSB_TRANSFER_'):]: value for key, value in libusb1.libusb_transfer_status.forward_dict.items()})
+# Translate libusb transfer status codes to human-y messages.
+_ERROR_MESSAGES = {
+    usb1.TRANSFER_ERROR: "error'd out",
+    usb1.TRANSFER_TIMED_OUT: "timed out",
+    usb1.TRANSFER_CANCELLED: "was prematurely cancelled",
+    usb1.TRANSFER_STALL: "was stalled",
+    usb1.TRANSFER_NO_DEVICE: "lost the device it was connected to",
+    usb1.TRANSFER_OVERFLOW: "got more data than expected"
+}
 
 
 class AsyncTransferManager():
     """ Class that stores the group of state needed to manage the asynchronous transfers. """
 
-    # Translate libusb transfer status codes to human-y messages.
-    _ERROR_MESSAGES = {
-        usb1.TRANSFER_ERROR: "error'd out",
-        usb1.TRANSFER_TIMED_OUT: "timed out",
-        usb1.TRANSFER_CANCELLED: "was prematurely cancelled",
-        usb1.TRANSFER_STALL: "was stalled",
-        usb1.TRANSFER_NO_DEVICE: "lost the device it was connected to",
-        usb1.TRANSFER_OVERFLOW: "got more data than expected"
-    }
 
-
-    def __init__(self, context: USBContext, device_handle: USBDeviceHandle, transfer_size, transfer_depth):
+    def __init__(self, context: USBContext, device_handle: USBDeviceHandle):
 
         self.context = context
         self.device_handle = device_handle
 
         self.active_transfers = []
         self.num_transfers = 0
-        self.completed_transfers = []
         self.total_data_transferred = 0
 
         self.start_time = None
         self.end_time = None
-
-        self.transfer_size = transfer_size
-        self.transfer_depth = transfer_depth
 
         self._error = None
 
@@ -184,31 +172,28 @@ class AsyncTransferManager():
         else:
 
             # Time to bail out.
+
+            # future.set_exception() feels like the way to go, except that libusb seems to sometimes lie
+            # about the error for the first transfer or two that fail. For example, if a device disconnects,
+            # sometimes the first transfer or two will error with LIBUSB_ERROR_IO or LIBUSB_ERROR_BUSY,
+            # and _then_ the later transfers will error with LIBUSB_ERROR_NO_DEVICE.
+            # Doing it this way will ensure that the last transfer to fail sets the actual error we use.
             self._error = status
             future.cancel()
 
 
     def _setup_transfers(self):
 
-        for _ in range(self.transfer_depth):
+        for _ in range(TRANSFER_QUEUE_DEPTH):
 
             # Allocate the transfer...
             transfer = self.device_handle.getTransfer()
-            transfer.setBulk(BULK_ENDPOINT_IN, self.transfer_size, timeout=1000,
+            transfer.setBulk(BULK_ENDPOINT_IN, TEST_TRANSFER_SIZE, timeout=1000,
                 callback=self._transfer_complete_cb)
-
 
             # ...and store it.
             self.active_transfers.append(transfer)
             self.num_transfers += 1
-
-
-    async def _wait_for_transfer_complete(self, transfer):
-
-        while transfer not in self.completed_transfers:
-            await asyncio.sleep(0)
-
-        self.completed_transfers.remove(transfer)
 
 
     def _should_cancel(self):
@@ -237,8 +222,6 @@ class AsyncTransferManager():
             except asyncio.CancelledError:
                 break
 
-            # await self._wait_for_transfer_complete(transfer)
-
         if self.end_time is None:
             self.end_time = time.time()
 
@@ -261,22 +244,22 @@ class AsyncTransferManager():
 
         asyncio.run(_gather_coroutines(*coroutines))
 
+        # _do_transfer() sets self.end_time.
         elapsed = self.end_time - self.start_time
 
         for transfer in self.active_transfers:
 
-            # libusb_transfer_free(transfer)
+            # libusb_transfer_free(transfer).
             del transfer
 
         if self._error:
             logging.error('Test failed because a transfer {}.'.format(self._ERROR_MESSAGES[self._error]))
+            sys.exit(self._error)
 
 
         bytes_per_second = self.total_data_transferred / (elapsed)
-        # logging.info('Received {} MB total at {} MB/s.'.format(self.total_data_transferred / 1000000, bytes_per_second / 1000000))
-
-        return bytes_per_second / 1000000
-
+        logging.info('Received {} MB total at {} MB/s.'.format(self.total_data_transferred / 1000000,
+            bytes_per_second / 1000000))
 
 
 def run_async_speed_test():
@@ -293,32 +276,8 @@ def run_async_speed_test():
         # ...and claim its bulk interface.
         handle.claimInterface(0)
 
-        averages = []
-
-        for test in range(10):
-
-            for transfer_size in range(1024, 1024 * 16, 1024):
-
-                for transfer_depth in range(2, 16):
-
-                    # logging.info("Async test with {:02} {} byte transfers.".format(transfer_depth, transfer_size))
-
-                    speeds = []
-
-                    for i in range(20):
-
-                        manager = AsyncTransferManager(context, handle, transfer_size, transfer_depth)
-                        speed = manager.run()
-                        speeds.append(speed)
-
-                    avg = sum(speeds) / len(speeds)
-                    # logging.info('{:02} {} byte transfers: {}'.format(transfer_depth, transfer_size, avg))
-                    averages.append((transfer_depth, transfer_size, avg))
-                    # logging.info('Average: {} MB/s.'.format(sum(speeds) / len(speeds)))
-
-            # logging.info("Maximum: {}".format((x for x in averages if x[
-            depth, size, avg = max(averages, key=lambda tup : tup[2])
-            logging.info("Maximum: {} {} byte transfers: {}".format(depth, size, avg))
+        manager = AsyncTransferManager(context, handle)
+        manager.run()
 
 
 def run_speed_test():
@@ -326,15 +285,6 @@ def run_speed_test():
 
     total_data_exchanged = 0
     failed_out = False
-
-    _messages = {
-        1: "error'd out",
-        2: "timed out",
-        3: "was prematurely cancelled",
-        4: "was stalled",
-        5: "lost the device it was connected to",
-        6: "sent more data than expected."
-    }
 
     def _should_terminate():
         """ Returns true iff our test should terminate. """
@@ -364,11 +314,13 @@ def run_speed_test():
             failed_out = status
 
 
-
     with usb1.USBContext() as context:
 
         # Grab a reference to our device...
         dev = context.openByVendorIDAndProductID(0x16d0, 0x0f3b)
+
+        if dev is None:
+            raise IOError("Test device not found.")
 
         # ... and claim its bulk interface.
         dev.claimInterface(0)
@@ -406,8 +358,8 @@ def run_speed_test():
                 transfer.cancel()
 
         # If we failed out; indicate it.
-        if (failed_out):
-            logging.error(f"Test failed because a transfer {_messages[failed_out]}.")
+        if failed_out:
+            logging.error(f"Test failed because a transfer {_ERROR_MESSAGES[failed_out]}.")
             sys.exit(failed_out)
 
 
@@ -422,15 +374,8 @@ if __name__ == "__main__":
     time.sleep(5)
 
     if device is not None:
-        logging.info(f"Starting bulk in speed test.")
+        logging.info("Starting bulk in speed test.")
         logging.info('Running sync test...')
         run_speed_test()
         logging.info('Running async test...')
         run_async_speed_test()
-
-        # if os.getenv('async') == 'yes':
-            # logging.info('Running async test...')
-            # run_async_speed_test()
-        # else:
-            # logging.info('Running sync test...')
-            # run_speed_test()
