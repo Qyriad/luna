@@ -9,27 +9,24 @@
 """ Generic USB analyzer backend generator for LUNA. """
 
 import time
-import errno
+import atexit
 
-
-import usb
 from datetime import datetime
 
-from nmigen                           import Signal, Elaboratable, Module
+import usb1
+
+from usb1 import USBContext
+
+from nmigen                           import Elaboratable, Module
 from usb_protocol.emitters            import DeviceDescriptorCollection
 
 from luna                             import get_appropriate_platform
 from luna.usb2                        import USBDevice, USBStreamInEndpoint
 
-from luna.gateware.utils.cdc          import synchronize
 from luna.gateware.architecture.car   import LunaECP5DomainGenerator
 
 from luna.gateware.interface.ulpi     import UTMITranslator
 from luna.gateware.usb.analyzer       import USBAnalyzer
-
-# Temporary.
-from luna.apollo                      import ApolloDebugger
-from luna.gateware.interface.uart     import UARTTransmitter
 
 
 USB_SPEED_HIGH       = 0b00
@@ -169,12 +166,41 @@ class USBAnalyzerConnection:
     work without requiring changes in e.g. our ViewSB frontend.
     """
 
+    # Class variable that stores our global libusb context.
+    _libusb_context: USBContext = None
+
+
     def __init__(self):
         """ Creates our connection to the USBAnalyzer. """
 
         self._buffer = bytearray()
-        self._device = None
+        self._device_handle = None
+        self._transfers = []
 
+
+    @classmethod
+    def _destroy_libusb_context(cls):
+        """ Destroys our libusb context on closing our Python instance. """
+
+        cls._libusb_context.close()
+        cls._libusb_context = None
+
+
+    @classmethod
+    def libusb_context(cls):
+        """ Retrieves the libusb context, creating one if needed.
+
+        Returns
+        -------
+        USBContext
+            The libusb context.
+        """
+
+        if cls._libusb_context is None:
+            cls._libusb_context = USBContext().open()
+            atexit.register(cls._destroy_libusb_context)
+
+        return cls._libusb_context
 
 
     def build_and_configure(self, capture_speed):
@@ -190,27 +216,22 @@ class USBAnalyzerConnection:
 
         time.sleep(3)
 
-        # For now, we'll use a slow, synchronous connection to the device via pyusb.
-        # This should be replaced with libusb1 for performance.
-        while not self._device:
+        while not self._device_handle:
 
             # FIXME: add timeout
-            self._device = usb.core.find(idVendor=USB_VENDOR_ID, idProduct=USB_PRODUCT_ID)
+            self._device_handle = self.libusb_context().openByVendorIDAndProductID(USB_VENDOR_ID, USB_PRODUCT_ID)
+
+        self._device_handle.claimInterface(0)
 
 
     def _fetch_data_into_buffer(self):
         """ Attempts a single data read from the analyzer into our buffer. """
 
         try:
-            data = self._device.read(BULK_ENDPOINT_ADDRESS, MAX_BULK_PACKET_SIZE)
+            data = self._device_handle.bulkRead(BULK_ENDPOINT_ADDRESS, MAX_BULK_PACKET_SIZE)
             self._buffer.extend(data)
-        except usb.core.USBError as e:
-            if e.errno == errno.ETIMEDOUT:
-                pass
-            else:
-                raise
-
-
+        except usb1.USBErrorTimeout:
+            pass
 
     def read_raw_packet(self):
         """ Reads a raw packet from our USB Analyzer. Blocks until a packet is complete.
