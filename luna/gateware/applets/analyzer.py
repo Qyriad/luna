@@ -40,6 +40,10 @@ BULK_ENDPOINT_NUMBER  = 1
 BULK_ENDPOINT_ADDRESS = 0x80 | BULK_ENDPOINT_NUMBER
 MAX_BULK_PACKET_SIZE  = 512
 
+TRANSFER_SIZE = 512
+TRANSFER_QUEUE_DEPTH = 4
+
+
 class USBAnalyzerApplet(Elaboratable):
     """ Gateware that serves as a generic USB analyzer backend.
 
@@ -224,23 +228,69 @@ class USBAnalyzerConnection:
         self._device_handle.claimInterface(0)
 
 
-    def _fetch_data_into_buffer(self):
-        """ Attempts a single data read from the analyzer into our buffer. """
+    def create_transfer(self):
 
-        try:
-            data = self._device_handle.bulkRead(BULK_ENDPOINT_ADDRESS, MAX_BULK_PACKET_SIZE)
+        transfer = self._device_handle.getTransfer()
+        transfer.setBulk(BULK_ENDPOINT_ADDRESS, TRANSFER_SIZE, timeout=1000,
+            callback=self._transfer_complete_cb)
+
+        return transfer
+
+
+    def _transfer_complete_cb(self, transfer):
+
+
+        status = transfer.getStatus()
+
+        if status == usb1.TRANSFER_COMPLETED:
+
+            data = transfer.getBuffer()
             self._buffer.extend(data)
-        except usb1.USBErrorTimeout:
-            pass
+
+            # Re-submit the transfer.
+            transfer.submit()
+
+        elif status == usb1.TRANSFER_TIMED_OUT:
+
+            transfer.submit()
+
+        elif status == usb1.TRANSFER_CANCELLED:
+
+            # This transfer has been Doomed (thanks to python-libusb1), so we can't just re-submit it.
+
+            self._transfers.remove(transfer)
+            del transfer
+
+            # Create a new transfer to replace it.
+            transfer = self.create_transfer()
+            self._transfers.append(transfer)
+            transfer.submit()
+
+        else:
+
+            usb1.raiseUSBError(status)
+
 
     def read_raw_packet(self):
         """ Reads a raw packet from our USB Analyzer. Blocks until a packet is complete.
 
-        Returns: packet, timestamp, flags:
-            packet    -- The raw packet data, as bytes.
-            timestamp -- The timestamp at which the packet was taken, in microseconds.
-            flags     -- Flags indicating connection status. Format TBD.
+        Returns
+        -------
+        packet: bytes
+            Raw packet data.
+        timestamp: datetime
+            The timestamp at which the packet was taken.
+        flags
+            Flags indicating connection status. Format TBD.
         """
+
+        # Set up transfers.
+        if not self._transfers:
+            for _ in range(TRANSFER_QUEUE_DEPTH):
+
+                transfer = self.create_transfer()
+                self._transfers.append(transfer)
+                transfer.submit()
 
         size = 0
         packet = None
@@ -248,21 +298,20 @@ class USBAnalyzerConnection:
         # Read until we get enough data to determine our packet's size...
         while not packet:
             while len(self._buffer) < 3:
-                self._fetch_data_into_buffer()
+                self.libusb_context().handleEvents()
 
-            # Extract our size from our buffer.
+            # Extract our size from our buffer...
             size = (self._buffer.pop(0) << 8) | self._buffer.pop(0)
 
-            # ... and read until we have a packet.
+            # ...and read until we have a packet.
             while len(self._buffer) < size:
-                self._fetch_data_into_buffer()
+                self.libusb_context().handleEvents()
 
-            # Extract our raw packet...
+            # Extract our raw packet.
             packet = self._buffer[0:size]
             del self._buffer[0:size]
 
-
-        # ... and return it.
+        # Return the extracted raw packet.
         # TODO: extract and provide status flags
         # TODO: generate a timestamp on-device
         return packet, datetime.now(), None
